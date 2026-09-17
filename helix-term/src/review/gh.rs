@@ -23,29 +23,58 @@ pub async fn run_gh<S: AsRef<OsStr> + std::fmt::Debug>(
     cwd: &Path,
     args: &[S],
 ) -> anyhow::Result<String> {
+    run_gh_with_stdin(cwd, args, None).await
+}
+
+/// Run `gh`, piping `input` (a JSON body) to its stdin.
+pub async fn run_gh_input<S: AsRef<OsStr> + std::fmt::Debug>(
+    cwd: &Path,
+    args: &[S],
+    input: &[u8],
+) -> anyhow::Result<String> {
+    run_gh_with_stdin(cwd, args, Some(input)).await
+}
+
+async fn run_gh_with_stdin<S: AsRef<OsStr> + std::fmt::Debug>(
+    cwd: &Path,
+    args: &[S],
+    input: Option<&[u8]>,
+) -> anyhow::Result<String> {
     let mut command = Command::new("gh");
     command
         .args(args)
         .current_dir(cwd)
         // Never let gh block the editor on an interactive question.
         .env("GH_PROMPT_DISABLED", "1")
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
 
-    let output = tokio::time::timeout(GH_TIMEOUT, command.output())
-        .await
-        .map_err(|_| anyhow!("gh did not respond within {} seconds", GH_TIMEOUT.as_secs()))?
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                anyhow!(
-                    "the `gh` CLI was not found on PATH; install it from \
+    let mut child = command.spawn().map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "the `gh` CLI was not found on PATH; install it from \
                      https://cli.github.com and log in with `gh auth login`"
-                )
-            } else {
-                anyhow!("failed to run `gh`: {err}")
-            }
-        })?;
+            )
+        } else {
+            anyhow!("failed to run `gh`: {err}")
+        }
+    })?;
+
+    if let Some(input) = input {
+        use tokio::io::AsyncWriteExt;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input).await?;
+        }
+    }
+
+    let output = tokio::time::timeout(GH_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| anyhow!("gh did not respond within {} seconds", GH_TIMEOUT.as_secs()))??;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -202,47 +231,42 @@ pub async fn fetch_comments(
     Ok(comments)
 }
 
-/// A new review comment to create on the PR head commit.
-#[derive(Debug, Clone)]
-pub struct NewComment {
-    pub commit_id: String,
-    pub path: String,
-    pub side: Side,
-    pub line: u32,
-    pub body: String,
-}
-
-/// Create a review comment on `(path, side, line)` of the PR head commit.
-pub async fn post_comment(
+/// Publish (create and submit) a review in a single request: the verdict
+/// (`APPROVE`, `REQUEST_CHANGES` or `COMMENT`), an optional summary body and
+/// the locally pending comments.
+pub async fn submit_review(
     cwd: &Path,
     owner: &str,
     repo: &str,
-    number: u64,
-    comment: &NewComment,
-) -> anyhow::Result<ReviewComment> {
-    let endpoint = format!("repos/{owner}/{repo}/pulls/{number}/comments");
-    let mut args: Vec<String> = vec![
-        "api".into(),
-        "-X".into(),
-        "POST".into(),
-        endpoint,
-        "-f".into(),
-        format!("body={}", comment.body),
-        "-f".into(),
-        format!("commit_id={}", comment.commit_id),
-        "-f".into(),
-        format!("path={}", comment.path),
-        "-F".into(),
-        format!("line={}", comment.line),
-    ];
-    if comment.side == Side::Left {
-        args.push("-f".into());
-        args.push("side=LEFT".into());
-    }
-    let output = run_gh(cwd, &args).await?;
-    let created: ReviewComment = serde_json::from_str(&output)
-        .map_err(|err| anyhow!("could not parse created comment: {err}"))?;
-    Ok(created)
+    detail: &PrDetail,
+    event: &str,
+    body: &str,
+    comments: &[super::PendingComment],
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "commit_id": detail.head_ref_oid,
+        "body": body,
+        "event": event,
+        "comments": comments
+            .iter()
+            .map(|comment| {
+                serde_json::json!({
+                    "path": comment.anchor.path,
+                    "side": comment.anchor.side.as_str(),
+                    "line": comment.anchor.line,
+                    "body": comment.body,
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    let endpoint = format!("repos/{owner}/{repo}/pulls/{}/reviews", detail.number);
+    run_gh_input(
+        cwd,
+        &["api", "--method", "POST", "--input", "-", &endpoint],
+        payload.to_string().as_bytes(),
+    )
+    .await?;
+    Ok(())
 }
 
 /// The commit to diff PR files against. GitHub compares the head against the

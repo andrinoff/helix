@@ -4144,8 +4144,16 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "pr-comment",
         aliases: &[],
-        doc: "Leave a review comment on the diff line under the cursor of the review buffer. Prompts for the body, or takes it as arguments.",
+        doc: "Leave a pending review comment on the line under the cursor (in the `:pr-diff` buffer or a reviewed file). Prompts for the body, or takes it as arguments. Comments are published with `:review`.",
         fun: review::pr_comment,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "review",
+        aliases: &[],
+        doc: "Publish a review of the loaded pull request with its pending comments: `:review approve`, `:review changes` or `:review comment`, optionally followed by a summary body.",
+        fun: review::review,
         completer: CommandCompleter::none(),
         signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
     }

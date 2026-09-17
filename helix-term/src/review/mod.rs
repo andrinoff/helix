@@ -21,7 +21,9 @@ pub mod render;
 
 pub use diff::{DiffLineKind, FileStatus, PrDiff, PrDiffLine, PrFileDiff, PrHunk};
 pub use gh::{PrDetail, ReviewComment, Side};
-pub use render::{diff_line_decoration, file_line_kinds, render_review};
+pub use render::{
+    commentable_lines, diff_line_decoration, file_line_kinds, render_review, review_virtual_lines,
+};
 
 fn review_state_cell() -> &'static Mutex<Option<ReviewState>> {
     static REVIEW_STATE: OnceLock<Mutex<Option<ReviewState>>> = OnceLock::new();
@@ -83,6 +85,67 @@ pub struct Rendered {
     pub line_anchors: Vec<Option<Anchor>>,
 }
 
+/// A comment that has not been submitted yet. Pending comments stay local
+/// (visible in the files, the diff buffer and the comment picker) until a
+/// review is published with `:review`.
+#[derive(Debug, Clone)]
+pub struct PendingComment {
+    pub anchor: Anchor,
+    pub body: String,
+}
+
+/// One styled run of text inside a [`VirtualRow`].
+#[derive(Debug, Clone)]
+pub struct RowSpan {
+    pub text: String,
+    pub kind: RowSpanKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowSpanKind {
+    /// Box-drawing frame of a comment block (`┌ │ └`).
+    Frame,
+    /// The commenter's name.
+    Author,
+    /// The text of a comment.
+    Body,
+    /// Content of a deleted line.
+    Content,
+}
+
+/// One rendered row of a virtual block (deleted lines / comment blocks shown
+/// inside a real file without touching its content).
+#[derive(Debug, Clone)]
+pub struct VirtualRow {
+    pub kind: VirtualRowKind,
+    pub spans: Vec<RowSpan>,
+}
+
+impl VirtualRow {
+    /// The row's text, without styling.
+    pub fn text(&self) -> String {
+        self.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualRowKind {
+    /// A line removed by the PR, shown for reference only.
+    Deleted,
+    /// A comment block (review comment).
+    Comment,
+    /// A comment that has not been submitted yet.
+    Pending,
+}
+
+/// Virtual rows anchored below a document line.
+#[derive(Debug, Clone)]
+pub struct VirtualBlock {
+    /// 0-based document line the virtual rows are anchored below.
+    pub line: usize,
+    pub rows: Vec<VirtualRow>,
+}
+
 /// Everything helix knows about the PR currently being reviewed.
 pub struct ReviewState {
     /// Workspace root the PR was checked out in.
@@ -102,6 +165,11 @@ pub struct ReviewState {
     /// to a `LineKind` per 0-based line of the working-tree file), used to
     /// highlight added lines in place.
     pub file_kinds: HashMap<String, Arc<[LineKind]>>,
+    /// Lines of each reviewed file that may receive a review comment
+    /// (1-based new-file line numbers that are part of the diff).
+    pub commentable: HashMap<String, std::collections::BTreeSet<u32>>,
+    /// Comments written locally, pending review submission.
+    pub pending: Vec<PendingComment>,
 }
 
 /// Fetch the base-branch content of `rel` and install it as the diff base of

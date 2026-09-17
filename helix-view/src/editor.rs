@@ -1946,6 +1946,16 @@ impl Editor {
             self.enter_normal_mode();
         }
 
+        // Every view may have been closed (for example when the document
+        // shown in the last view was closed). `Action::Replace` needs a view
+        // to replace, so create one in that case.
+        if matches!(action, Action::Replace) && self.tree.try_get(self.tree.focus).is_none() {
+            let view = crate::view::View::new(id, self.config().gutters.clone());
+            let view_id = self.tree.split(view, Layout::Vertical);
+            let doc = doc_mut!(self, &id);
+            doc.ensure_view_init(view_id);
+        }
+
         let focust_lost = match action {
             Action::Replace => {
                 let (view, doc) = current_ref!(self);

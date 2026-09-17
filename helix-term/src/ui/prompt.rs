@@ -47,6 +47,9 @@ pub struct Prompt {
     pub doc_fn: DocFn,
     next_char_handler: Option<PromptCharHandler>,
     language: Option<(&'static str, Arc<ArcSwap<syntax::Loader>>)>,
+    /// Render the input as bullets instead of its actual contents. Used for
+    /// secrets such as SSH passphrases.
+    masked: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -103,6 +106,7 @@ impl Prompt {
             doc_fn: Box::new(|_| None),
             next_char_handler: None,
             language: None,
+            masked: false,
         }
     }
 
@@ -114,6 +118,12 @@ impl Prompt {
 
     pub fn with_line(mut self, line: String, editor: &Editor) -> Self {
         self.set_line(line, editor);
+        self
+    }
+
+    /// Hide the entered text (secrets such as passphrases).
+    pub fn with_masked_input(mut self) -> Self {
+        self.masked = true;
         self
     }
 
@@ -135,6 +145,19 @@ impl Prompt {
 
     pub fn line(&self) -> &String {
         &self.line
+    }
+
+    /// The input text as it should be displayed: the visible part of the line,
+    /// or one mask character per grapheme when the prompt is masked. Masking
+    /// per grapheme keeps the cursor position (computed from the real text)
+    /// valid.
+    fn display_input(&self) -> String {
+        let visible = &self.line.as_str()[self.anchor..];
+        if self.masked {
+            mask_input(visible)
+        } else {
+            visible.to_string()
+        }
     }
 
     pub fn with_history_register(&mut self, history_register: Option<char>) -> &mut Self {
@@ -589,12 +612,13 @@ impl Prompt {
                     .unwrap();
             }
 
+            let visible = self.display_input();
             surface.set_string_anchored(
                 self.line_area.x,
                 self.line_area.y,
                 self.truncate_start,
                 self.truncate_end,
-                &self.line.as_str()[self.anchor..],
+                &visible,
                 line_width,
                 |_| prompt_color,
             );
@@ -796,5 +820,31 @@ impl Component for Prompt {
             Some(Position::new(area.y as usize + line, col)),
             editor.config().cursor_shape.from_mode(Mode::Insert),
         )
+    }
+}
+
+/// Replace every visible grapheme with a bullet, keeping zero-width modifiers
+/// (and therefore the display width of the line) intact.
+fn mask_input(text: &str) -> String {
+    text.graphemes(true)
+        .map(|grapheme| if grapheme.width() == 0 { "" } else { "•" })
+        .collect()
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::mask_input;
+    use helix_core::unicode::width::UnicodeWidthStr;
+
+    #[test]
+    fn masking_hides_the_input() {
+        assert_eq!(mask_input("hunter2"), "•••••••");
+        // Combining characters must not add extra bullets.
+        assert_eq!(mask_input("e\u{301}x"), "••");
+    }
+
+    #[test]
+    fn masking_preserves_width() {
+        assert_eq!(mask_input("hunter2").width(), "hunter2".width());
     }
 }

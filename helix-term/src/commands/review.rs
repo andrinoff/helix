@@ -4,7 +4,7 @@
 //! review comments into a read-only diff buffer with inline comment blocks.
 //! `:pr-comment` posts a comment for the diff line under the cursor.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use helix_core::command_line::Args;
 use helix_core::Rope;
@@ -14,7 +14,7 @@ use helix_view::{DocumentId, Editor, ViewId};
 use crate::compositor::{self, Compositor};
 use crate::job::{self, Callback};
 use crate::review::diff::{parse_unified_diff, FileStatus};
-use crate::review::gh::{self, PrDetail, PrListItem, ReviewComment, Side};
+use crate::review::gh::{self, PrDetail, PrListItem, Side};
 use crate::review::{self, file_line_kinds, render_review, ReviewState};
 use crate::ui::overlay::overlaid;
 use crate::ui::{self, Picker, PickerColumn, Prompt, PromptEvent};
@@ -138,30 +138,47 @@ pub(crate) fn pr_comments(
     }
     let entries = review::with_review_state(|state| {
         let root = state.workspace_root.clone();
-        let entries: Vec<CommentEntry> = state
-            .comments
-            .iter()
-            .map(|comment| {
-                let (path, side, line) = comment
-                    .anchor()
-                    .map(|(path, side, line)| (path.to_string(), side, line))
-                    .unwrap_or((String::new(), Side::Right, 0));
-                CommentEntry {
-                    comment: comment.clone(),
-                    path: root.join(&path),
-                    location: format!(
-                        "{}:{} ({})",
-                        path,
-                        line,
-                        match side {
-                            Side::Right => "new",
-                            Side::Left => "old",
-                        }
-                    ),
-                    line: line as usize,
-                }
-            })
-            .collect();
+        let mut entries: Vec<CommentEntry> = Vec::new();
+        for comment in &state.comments {
+            let (path, side, line) = comment
+                .anchor()
+                .map(|(path, side, line)| (path.to_string(), side, line))
+                .unwrap_or((String::new(), Side::Right, 0));
+            entries.push(CommentEntry {
+                author: format!("@{}", comment.login()),
+                path: root.join(&path),
+                location: format!(
+                    "{}:{} ({})",
+                    path,
+                    line,
+                    match side {
+                        Side::Right => "new",
+                        Side::Left => "old",
+                    }
+                ),
+                body: comment.body.clone(),
+                line: line as usize,
+            });
+        }
+        for comment in &state.pending {
+            let anchor = &comment.anchor;
+            let side = anchor.side;
+            entries.push(CommentEntry {
+                author: "you (pending)".into(),
+                path: root.join(&anchor.path),
+                location: format!(
+                    "{}:{} ({})",
+                    anchor.path,
+                    anchor.line,
+                    match side {
+                        Side::Right => "new",
+                        Side::Left => "old",
+                    }
+                ),
+                body: comment.body.clone(),
+                line: anchor.line as usize,
+            });
+        }
         entries
     });
     let Some(entries) = entries else {
@@ -172,13 +189,13 @@ pub(crate) fn pr_comments(
 
     let columns = [
         PickerColumn::new("author", |entry: &CommentEntry, _data: &()| {
-            format!("@{}", entry.comment.login()).into()
+            entry.author.clone().into()
         }),
         PickerColumn::new("location", |entry: &CommentEntry, _data: &()| {
             entry.location.clone().into()
         }),
         PickerColumn::new("comment", |entry: &CommentEntry, _data: &()| {
-            one_line(&entry.comment.body).into()
+            one_line(&entry.body).into()
         }),
     ];
     cx.jobs.callback(async move {
@@ -227,7 +244,14 @@ pub(crate) fn pr_comment(
     }
     let body = args.join(" ");
     if !body.trim().is_empty() {
-        post_comment_at_cursor(cx, body.trim().to_string());
+        let target = match comment_target(cx) {
+            Ok(target) => target,
+            Err(message) => {
+                cx.editor.set_error(message);
+                return Ok(());
+            }
+        };
+        add_pending_comment(cx.editor, target.anchor, body.trim().to_string());
         return Ok(());
     }
 
@@ -257,7 +281,7 @@ pub(crate) fn pr_comment(
                             cx.editor.set_error("Comment body is empty");
                             return;
                         }
-                        cx.jobs.callback(post_comment_job(target.clone(), body));
+                        add_pending_comment(cx.editor, target.anchor.clone(), body);
                     },
                 );
                 prompt.recalculate_completion(_editor);
@@ -268,29 +292,93 @@ pub(crate) fn pr_comment(
     Ok(())
 }
 
-#[derive(Clone)]
-struct CommentTarget {
-    cwd: PathBuf,
-    owner: String,
-    repo: String,
-    number: u64,
-    commit_id: String,
-    path: String,
-    side: Side,
-    line: u32,
+/// Publish the pending comments together with a review verdict
+/// (`:review approve|changes|comment [body]`).
+pub(crate) fn review(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let Some(kind) = args.first().map(str::to_ascii_lowercase) else {
+        cx.editor
+            .set_error("Usage: :review approve|changes|comment [body]");
+        return Ok(());
+    };
+    let event_kind = match kind.as_str() {
+        "approve" => "APPROVE",
+        "changes" | "request-changes" => "REQUEST_CHANGES",
+        "comment" => "COMMENT",
+        _ => {
+            cx.editor
+                .set_error("Unknown review kind; expected approve, changes or comment");
+            return Ok(());
+        }
+    };
+    let body: String = args
+        .iter()
+        .skip(1)
+        .map(|arg| arg.as_ref())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let Some((cwd, owner, repo, detail, pending)) = review::with_review_state(|state| {
+        (
+            state.workspace_root.clone(),
+            state.owner.clone(),
+            state.repo.clone(),
+            state.detail.clone(),
+            state.pending.clone(),
+        )
+    }) else {
+        cx.editor
+            .set_error("No pull request is loaded; run :pr first");
+        return Ok(());
+    };
+    if pending.is_empty() && body.trim().is_empty() {
+        cx.editor.set_error(
+            "Nothing to publish: add comments with `:pr-comment` or give a summary body",
+        );
+        return Ok(());
+    }
+
+    cx.editor.set_status(format!("Submitting review ({kind})…"));
+    cx.jobs.callback(async move {
+        gh::submit_review(
+            &cwd,
+            &owner,
+            &repo,
+            &detail,
+            event_kind,
+            body.trim(),
+            &pending,
+        )
+        .await?;
+        // Fetch the submitted comments back so they render as remote ones.
+        let comments = gh::fetch_comments(&cwd, &owner, &repo, detail.number).await?;
+        Ok(Callback::EditorCompositor(Box::new(move |editor, _| {
+            let Some(()) = review::with_review_state(|state| {
+                state.comments = comments;
+                state.pending.clear();
+                state.rendered =
+                    render_review(&state.detail, &state.diff, &state.comments, &state.pending);
+            }) else {
+                return;
+            };
+            if let Err(error) = open_diff_buffer(editor) {
+                editor.set_error(error.to_string());
+            }
+            editor.set_status("Review submitted");
+        })))
+    });
+    Ok(())
 }
 
-impl CommentTarget {
-    /// The parts of the target needed to create the comment itself.
-    fn new_comment(&self, body: String) -> gh::NewComment {
-        gh::NewComment {
-            commit_id: self.commit_id.clone(),
-            path: self.path.clone(),
-            side: self.side,
-            line: self.line,
-            body,
-        }
-    }
+#[derive(Clone)]
+struct CommentTarget {
+    anchor: review::Anchor,
 }
 
 struct PrFileEntry {
@@ -300,10 +388,12 @@ struct PrFileEntry {
 }
 
 struct CommentEntry {
-    comment: ReviewComment,
+    /// Author display name (`@login` or `you (pending)`).
+    author: String,
     path: PathBuf,
     /// `path:line (side)` display string.
     location: String,
+    body: String,
     /// 0-based line number of the anchor in the working-tree file.
     line: usize,
 }
@@ -330,75 +420,85 @@ fn workspace_root(cx: &compositor::Context) -> PathBuf {
     doc!(cx.editor).workspace_root().to_path_buf()
 }
 
-/// The diff line under the cursor of the current view.
+/// The diff line (of the `:pr-diff` buffer) or the file line (of a reviewed
+/// file) under the cursor.
 fn comment_target(cx: &compositor::Context) -> Result<CommentTarget, String> {
-    let Some(diff_doc) = review::with_review_state(|state| state.diff_doc) else {
+    let Some(state) = review::with_review_state(|state| {
+        (
+            state.diff_doc,
+            state.workspace_root.clone(),
+            state.rendered.line_anchors.clone(),
+        )
+    }) else {
         return Err("No pull request is loaded; run :pr first".into());
     };
-    let Some(diff_doc) = diff_doc else {
-        return Err("The PR diff buffer is not open; run :pr-diff".into());
-    };
+    let (diff_doc, root, line_anchors) = state;
+
     let (view, doc) = current_ref!(cx.editor);
-    if view.doc != diff_doc {
-        return Err("Move the cursor into the PR diff buffer (:pr-diff) first".into());
+
+    // Inside the `:pr-diff` buffer the anchor comes from the rendered lines.
+    if Some(view.doc) == diff_doc {
+        let line = doc
+            .selection(view.id)
+            .primary()
+            .cursor_line(doc.text().slice(..));
+        let Some(Some(anchor)) = line_anchors.get(line) else {
+            return Err("The cursor is not on a diff line".into());
+        };
+        return Ok(CommentTarget {
+            anchor: anchor.clone(),
+        });
     }
+
+    // Inside a real file: the anchor is the cursor line, but only lines that
+    // are part of the diff can be commented on.
+    let path = doc
+        .path()
+        .and_then(|path| path.strip_prefix(&root).ok().map(Path::to_string_lossy))
+        .ok_or_else(|| "Move the cursor into the PR diff buffer (:pr-diff) first".to_string())?;
     let line = doc
         .selection(view.id)
         .primary()
         .cursor_line(doc.text().slice(..));
-
-    let anchor = review::with_review_state(|state| {
+    let Some(anchor) = review::with_review_state(|state| {
         state
-            .rendered
-            .line_anchors
-            .get(line)
-            .and_then(|anchor| anchor.clone())
+            .commentable
+            .get(path.as_ref())
+            .is_some_and(|lines| lines.contains(&((line + 1) as u32)))
+            .then(|| review::Anchor {
+                path: path.into_owned(),
+                side: Side::Right,
+                line: (line + 1) as u32,
+            })
     })
-    .flatten();
-    let Some(anchor) = anchor else {
-        return Err("The cursor is not on a diff line".into());
+    .flatten() else {
+        return Err(
+            "This line is not part of the PR diff; comments must anchor to a changed line".into(),
+        );
     };
-
-    review::with_review_state(|state| CommentTarget {
-        cwd: state.workspace_root.clone(),
-        owner: state.owner.clone(),
-        repo: state.repo.clone(),
-        number: state.detail.number,
-        commit_id: state.detail.head_ref_oid.clone(),
-        path: anchor.path,
-        side: anchor.side,
-        line: anchor.line,
-    })
-    .ok_or_else(|| "No pull request is loaded; run :pr first".into())
+    Ok(CommentTarget { anchor })
 }
 
-fn post_comment_at_cursor(cx: &mut compositor::Context, body: String) {
-    let target = match comment_target(cx) {
-        Ok(target) => target,
-        Err(message) => {
-            cx.editor.set_error(message);
-            return;
-        }
+/// Add a locally pending comment and refresh the rendered views. Pending
+/// comments are only submitted when a review is published with `:review`.
+fn add_pending_comment(editor: &mut Editor, anchor: review::Anchor, body: String) {
+    let Some(()) = review::with_review_state(|state| {
+        state.pending.push(review::PendingComment {
+            anchor,
+            body: body.clone(),
+        });
+        state.rendered = render_review(&state.detail, &state.diff, &state.comments, &state.pending);
+    }) else {
+        editor.set_error("No pull request is loaded; run :pr first");
+        return;
     };
-    cx.jobs.callback(post_comment_job(target, body));
-}
-
-/// Spawn the comment POST, then refresh the comments and the review buffer.
-async fn post_comment_job(target: CommentTarget, body: String) -> anyhow::Result<Callback> {
-    gh::post_comment(
-        &target.cwd,
-        &target.owner,
-        &target.repo,
-        target.number,
-        &target.new_comment(body),
-    )
-    .await?;
-    let comments =
-        gh::fetch_comments(&target.cwd, &target.owner, &target.repo, target.number).await?;
-    Ok(Callback::EditorCompositor(Box::new(move |editor, _| {
-        refresh_review(editor, comments);
-        editor.set_status("Comment posted");
-    })))
+    if let Err(error) = open_diff_buffer(editor) {
+        editor.set_error(error.to_string());
+    }
+    editor.set_status(format!(
+        "Pending comment added ({}) — publish with `:review approve|changes|comment`",
+        review::with_review_state(|state| state.pending.len()).unwrap_or_default()
+    ));
 }
 
 /// Open the PR list picker and stream results from `gh pr list`.
@@ -518,8 +618,9 @@ async fn checkout_and_review(cwd: PathBuf, number: u64) -> anyhow::Result<Callba
     let comments = gh::fetch_comments(&cwd, &owner, &repo, number).await?;
 
     let diff = parse_unified_diff(&diff_text);
-    let rendered = render_review(&detail, &diff, &comments);
+    let rendered = render_review(&detail, &diff, &comments, &[]);
     let file_kinds = file_line_kinds(&diff);
+    let commentable = review::commentable_lines(&diff);
     let diff_base_sha = gh::fetch_diff_base_sha(
         &cwd,
         &owner,
@@ -544,6 +645,8 @@ async fn checkout_and_review(cwd: PathBuf, number: u64) -> anyhow::Result<Callba
                 diff_doc: previous_doc,
                 diff_base_sha,
                 file_kinds,
+                commentable,
+                pending: Vec::new(),
             }));
             // The working tree changed under every open document.
             reload_all_docs(editor);
@@ -602,30 +705,21 @@ fn prime_diff_bases(editor: &mut Editor) {
     }
 }
 
-/// Regenerate the review buffer after the comments changed.
-fn refresh_review(editor: &mut Editor, comments: Vec<ReviewComment>) {
-    if review::with_review_state(|state| {
-        state.comments = comments;
-        state.rendered = render_review(&state.detail, &state.diff, &state.comments);
-    })
-    .is_none()
-    {
-        return;
-    }
-    if let Err(error) = open_diff_buffer(editor) {
-        editor.set_error(error.to_string());
-    }
-}
-
 /// Create (or refill) the read-only review buffer with the rendered diff.
 fn open_diff_buffer(editor: &mut Editor) -> anyhow::Result<DocumentId> {
     let text = review::with_review_state(|state| state.rendered.text.clone())
         .ok_or_else(|| anyhow::anyhow!("No pull request is loaded; run :pr first"))?;
 
+    // Reuse the existing overview buffer only while it is still open and
+    // displayed; otherwise open a fresh one beside the reviewed file so the
+    // file (and its LSP-backed view) stays available.
     let doc_id = match review::with_review_state(|state| state.diff_doc) {
-        Some(Some(id)) if editor.documents.contains_key(&id) => id,
+        Some(Some(id)) if view_showing(editor, id).is_some() => id,
         _ => {
-            let id = editor.new_file(Action::Replace);
+            // Open beside the reviewed file rather than replacing it, so the
+            // file (and its LSP-backed view) stays available while the
+            // overview is open.
+            let id = editor.new_file(Action::VerticalSplit);
             review::with_review_state(|state| state.diff_doc = Some(id));
             id
         }
@@ -646,6 +740,15 @@ fn open_diff_buffer(editor: &mut Editor) -> anyhow::Result<DocumentId> {
     let transaction = helix_core::diff::compare_ropes(doc.text(), &new_text);
     doc.apply(&transaction, view_id);
     Ok(doc_id)
+}
+
+/// A view currently displaying `doc_id`, if any.
+fn view_showing(editor: &Editor, doc_id: DocumentId) -> Option<ViewId> {
+    editor
+        .tree
+        .views()
+        .find(|(view, _)| view.doc == doc_id)
+        .map(|(view, _)| view.id)
 }
 
 /// A view that displays `doc_id`, creating selection state if needed.

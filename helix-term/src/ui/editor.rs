@@ -91,7 +91,7 @@ impl EditorView {
 
         let view_offset = doc.view_offset(view.id);
 
-        let text_annotations = view.text_annotations(doc, Some(theme));
+        let mut text_annotations = view.text_annotations(doc, Some(theme));
         let mut decorations = DecorationManager::default();
 
         if is_focused && config.cursorline {
@@ -121,6 +121,15 @@ impl EditorView {
         if let Some(decoration) =
             crate::review::diff_line_decoration(doc.id(), doc.path(), theme, inner)
         {
+            decorations.add_decoration(decoration);
+        }
+
+        // Virtual rows in real files: the PR's deleted lines and the comment
+        // blocks (remote + pending) rendered below their anchor lines.
+        if let Some((annotation, decoration)) =
+            crate::review::review_virtual_lines(doc, theme, inner.width as usize)
+        {
+            text_annotations.add_line_annotation(Box::new(annotation));
             decorations.add_decoration(decoration);
         }
 

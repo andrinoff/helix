@@ -229,7 +229,9 @@ impl AskpassSession {
                     };
                     let _ = answer_sender.try_send(answer);
                 },
-            );
+            )
+            // The passphrase must never be visible on screen.
+            .with_masked_input();
             prompt.recalculate_completion(_editor);
             compositor.push(Box::new(prompt));
         });
