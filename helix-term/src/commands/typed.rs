@@ -4108,6 +4108,46 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: exclude_workspace,
         completer: CommandCompleter::none(),
         signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "pr",
+        aliases: &[],
+        doc: "List open pull requests and check out the selected one to review it, or `:pr <number>` to open a specific PR.",
+        fun: review::pr,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(1)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "pr-diff",
+        aliases: &[],
+        doc: "Open (or refill) the review buffer showing the loaded pull request's diff.",
+        fun: review::pr_diff,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "pr-files",
+        aliases: &[],
+        doc: "Open a picker of the files changed by the loaded pull request.",
+        fun: review::pr_files,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "pr-comments",
+        aliases: &[],
+        doc: "Open a picker of the review comments of the loaded pull request.",
+        fun: review::pr_comments,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "pr-comment",
+        aliases: &[],
+        doc: "Leave a review comment on the diff line under the cursor of the review buffer. Prompts for the body, or takes it as arguments.",
+        fun: review::pr_comment,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
     }
 ];
 

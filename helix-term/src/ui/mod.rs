@@ -19,6 +19,7 @@ use crate::compositor::Compositor;
 use crate::filter_picker_entry;
 use crate::job::{self, Callback};
 pub use completion::Completion;
+pub use document::{LinePos, TextRenderer};
 pub use editor::EditorView;
 use helix_stdx::rope;
 use helix_view::theme::Style;
@@ -30,6 +31,7 @@ pub use prompt::{Prompt, PromptEvent};
 pub use select::Select;
 pub use spinner::{ProgressSpinners, Spinner};
 pub use text::Text;
+pub use text_decorations::{Decoration, DecorationManager};
 
 use helix_view::Editor;
 use tui::text::{Span, Spans};

@@ -1,5 +1,6 @@
 pub(crate) mod dap;
 pub(crate) mod lsp;
+pub(crate) mod review;
 pub(crate) mod syntax;
 pub(crate) mod typed;
 
