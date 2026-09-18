@@ -367,9 +367,7 @@ pub(crate) fn review(
             }) else {
                 return;
             };
-            if let Err(error) = open_diff_buffer(editor) {
-                editor.set_error(error.to_string());
-            }
+            refresh_diff_buffer_if_open(editor);
             editor.set_status("Review submitted");
         })))
     });
@@ -492,9 +490,7 @@ fn add_pending_comment(editor: &mut Editor, anchor: review::Anchor, body: String
         editor.set_error("No pull request is loaded; run :pr first");
         return;
     };
-    if let Err(error) = open_diff_buffer(editor) {
-        editor.set_error(error.to_string());
-    }
+    refresh_diff_buffer_if_open(editor);
     editor.set_status(format!(
         "Pending comment added ({}) — publish with `:review approve|changes|comment`",
         review::with_review_state(|state| state.pending.len()).unwrap_or_default()
@@ -633,7 +629,18 @@ async fn checkout_and_review(cwd: PathBuf, number: u64) -> anyhow::Result<Callba
 
     Ok(Callback::EditorCompositor(Box::new(
         move |editor, compositor| {
-            let previous_doc = review::with_review_state(|state| state.diff_doc).flatten();
+            // Pending comments recorded while the (slow) load ran survive a
+            // reload of the same PR; they are dropped when switching PRs.
+            let (previous_doc, previous_pending, previous_number) =
+                review::with_review_state(|state| {
+                    (state.diff_doc, state.pending.clone(), state.detail.number)
+                })
+                .unwrap_or((None, Vec::new(), 0));
+            let pending = if previous_number == detail.number {
+                previous_pending
+            } else {
+                Vec::new()
+            };
             review::set_review_state(Some(ReviewState {
                 workspace_root: cwd.clone(),
                 detail,
@@ -646,7 +653,7 @@ async fn checkout_and_review(cwd: PathBuf, number: u64) -> anyhow::Result<Callba
                 diff_base_sha,
                 file_kinds,
                 commentable,
-                pending: Vec::new(),
+                pending,
             }));
             // The working tree changed under every open document.
             reload_all_docs(editor);
@@ -702,6 +709,21 @@ fn prime_diff_bases(editor: &mut Editor) {
         .collect();
     for (doc_id, cwd, owner, repo, base_sha, rel) in targets {
         review::schedule_base_fetch(cwd, owner, repo, base_sha, rel, doc_id);
+    }
+}
+
+/// Refill the overview buffer, but only when it is actually open. Recording
+/// a pending comment or publishing a review must not open it as a side
+/// effect.
+fn refresh_diff_buffer_if_open(editor: &mut Editor) {
+    let open = review::with_review_state(|state| state.diff_doc)
+        .flatten()
+        .is_some_and(|id| editor.documents.contains_key(&id));
+    if !open {
+        return;
+    }
+    if let Err(error) = open_diff_buffer(editor) {
+        editor.set_error(error.to_string());
     }
 }
 

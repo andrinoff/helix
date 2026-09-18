@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use helix_core::text_annotations::LineAnnotation;
 use helix_core::Position;
-use helix_view::graphics::{Modifier, Rect};
+use helix_view::graphics::{Color, Modifier, Rect};
 use helix_view::theme::{Style, Theme};
 use helix_view::DocumentId;
 
@@ -514,6 +514,29 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// The diff highlight colors are designed as foregrounds; used as row
+/// backgrounds they are glaring, so they are blended toward black.
+fn dimmed(color: Color) -> Color {
+    const FACTOR: f32 = 0.4;
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            (r as f32 * FACTOR) as u8,
+            (g as f32 * FACTOR) as u8,
+            (b as f32 * FACTOR) as u8,
+        ),
+        other => other,
+    }
+}
+
+/// A row background derived from a diff theme color: the theme's foreground
+/// is reused as the background, dimmed.
+fn diff_row_background(theme: &Theme, key: &str) -> Style {
+    let mut style = theme.get(key);
+    style.bg = style.fg.map(dimmed);
+    style.fg = None;
+    style
+}
+
 /// A full-line highlight decoration for PR-reviewed buffers.
 ///
 /// Two buffer kinds are decorated:
@@ -539,16 +562,10 @@ pub fn diff_line_decoration(
         state.file_kinds.get(rel).cloned()
     })??;
 
-    fn row_style(theme: &Theme, key: &str) -> Style {
-        let mut style = theme.get(key);
-        style.bg = style.fg;
-        style.fg = None;
-        style
-    }
-    let style_add = row_style(theme, "diff.plus");
-    let style_del = row_style(theme, "diff.minus");
-    let style_header = row_style(theme, "diff.delta");
-    let style_comment = row_style(theme, "ui.virtual");
+    let style_add = diff_row_background(theme, "diff.plus");
+    let style_del = diff_row_background(theme, "diff.minus");
+    let style_header = diff_row_background(theme, "diff.delta");
+    let style_comment = diff_row_background(theme, "ui.virtual");
 
     Some(move |renderer: &mut TextRenderer, pos: LinePos| {
         let Some(&kind) = line_kinds.get(pos.doc_line) else {
@@ -632,18 +649,12 @@ impl ReviewVirtualLines {
             .collect();
         entries.sort_by_key(|(line, _, _)| *line);
 
-        fn row_style(theme: &Theme, key: &str) -> Style {
-            let mut style = theme.get(key);
-            style.bg = style.fg;
-            style.fg = None;
-            style
-        }
         let style_body = body_style(theme);
         ReviewVirtualLines {
             entries,
-            style_row_deleted: row_style(theme, "diff.minus"),
-            style_row_comment: row_style(theme, "ui.virtual"),
-            style_row_pending: row_style(theme, "diff.delta"),
+            style_row_deleted: diff_row_background(theme, "diff.minus"),
+            style_row_comment: diff_row_background(theme, "ui.virtual"),
+            style_row_pending: diff_row_background(theme, "diff.delta"),
             style_author: author_style(theme),
             style_body,
             style_frame: style_body.with_dim(),
@@ -737,8 +748,14 @@ impl Decoration for ReviewVirtualLines {
             return Position::new(0, 0);
         };
         let start_row = pos.visual_line + virt_off.row as u16;
+        // Rows below the viewport bottom would panic the renderer; they are
+        // simply not drawn (the reservation stays, matching the layout).
+        let viewport_bottom = renderer.viewport.y + renderer.viewport.height;
         for (i, row) in rows.iter().enumerate() {
             let y = start_row + i as u16;
+            if y >= viewport_bottom {
+                break;
+            }
             let style = self.row_style(row.kind);
             // Paint the full row so the block reads as a contiguous area,
             // then draw the styled spans on top of it.
@@ -855,7 +872,7 @@ diff --git a/src/lib.rs b/src/lib.rs
         assert_eq!(anchor.as_ref().unwrap().line, 10);
         assert_eq!(anchor.as_ref().unwrap().path, "src/lib.rs");
         assert!(rendered
-            .text()
+            .text
             .lines()
             .nth(anchor_line)
             .unwrap()
@@ -977,6 +994,37 @@ Binary files a/img.png and b/img.png differ
     }
 
     #[test]
+    fn row_backgrounds_are_dimmed() {
+        let theme = helix_view::theme::Loader::new(&[]).default_theme(true);
+        let background = diff_row_background(&theme, "diff.plus");
+        let foreground = theme.get("diff.plus").fg;
+        match (background.bg, foreground) {
+            (Some(Color::Rgb(br, bg_, bb)), Some(Color::Rgb(fr, fg_, fb))) => {
+                assert!(br < fr && bg_ < fg_ && bb < fb, "background must be darker");
+            }
+            _ => panic!("expected rgb colors"),
+        }
+    }
+
+    #[test]
+    fn comment_styles_resolve_to_colors() {
+        // The default theme must produce visible colors for both parts of a
+        // comment, otherwise the block would render unstyled.
+        let theme = helix_view::theme::Loader::new(&[]).default_theme(true);
+        let author = author_style(&theme);
+        let body = body_style(&theme);
+        assert!(
+            author.fg.is_some(),
+            "comment authors should resolve to a color"
+        );
+        assert!(body.fg.is_some(), "comment text should resolve to a color");
+        assert_ne!(
+            author.fg, body.fg,
+            "authors and comment text should be distinguishable"
+        );
+    }
+
+    #[test]
     fn builds_file_virtual_blocks() {
         let diff = parse_unified_diff(SIMPLE_DIFF);
         let file = diff
@@ -1023,7 +1071,15 @@ Binary files a/img.png and b/img.png differ
             })
             .unwrap();
         assert_eq!(comment.line, 11);
-        assert!(comment.rows[0].text.contains("┌ @alice: nice"));
+        assert!(comment.rows[0].text().contains("┌ @alice: nice"));
+        // The username and the comment text are separate spans so they can be
+        // colored differently.
+        let spans = &comment.rows[0].spans;
+        assert_eq!(spans[1].kind, RowSpanKind::Author);
+        assert_eq!(spans[1].text, "@alice:");
+        assert_eq!(spans[2].kind, RowSpanKind::Body);
+        assert_eq!(spans[2].text, " nice");
+        assert_eq!(spans[0].kind, RowSpanKind::Frame);
         let pending_block = blocks
             .iter()
             .find(|block| {

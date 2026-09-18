@@ -26,8 +26,13 @@ Typing `:pr` lists the open pull requests of the current repository; selecting o
 - `:pr-files` — pick a file changed by the pull request and open it in the editor
 - `:pr-diff` — open the unified diff overview (with inline review comments) in a read-only buffer
 - `:pr-comments` — browse all review comments; selecting one jumps to the commented file and line
-- `:pr-comment [body...]` — leave a review comment on the diff line under the cursor in the `:pr-diff` buffer; without arguments a prompt asks for the body
+- `:pr-comment [body...]` — record a pending review comment on the line under the cursor; without arguments a prompt asks for the body
+- `:review approve|changes|comment [body...]` — publish the review with its pending comments
+
+Comments are written locally first: they show up immediately (in the file and in the `:pr-diff` overview) and are only sent to GitHub when a review is published with `:review`, which submits all of them at once together with the verdict. `:review comment` publishes comments without a verdict, `:review approve` approves the pull request and `:review changes` requests changes.
+
+Deleted lines are shown inline in the files as read-only rows, and comment blocks are colored by author (yellow by default, via the `review.comment.author` theme key) and body text (`review.comment.body`). Nothing is written into the file, so language servers are unaffected.
 
 Comments can only be attached to lines that are part of the diff (like on GitHub); comments on lines of a previous diff revision are shown under a trailing outdated comments section.
 
-If the remote is fetched over SSH and the key needs a passphrase, helix shows an in-editor prompt with the `ssh` question instead of hanging; the passphrase is used for that checkout only and never stored.
+If the remote is fetched over SSH and the key needs a passphrase, helix shows an in-editor prompt with the `ssh` question instead of hanging; the typed passphrase is masked, used for that checkout only and never stored.
