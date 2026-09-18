@@ -144,12 +144,14 @@ pub(crate) fn pr_comments(
                 .anchor()
                 .map(|(path, side, line)| (path.to_string(), side, line))
                 .unwrap_or((String::new(), Side::Right, 0));
+            let start = comment.start_line.or(comment.original_start_line);
             entries.push(CommentEntry {
                 author: format!("@{}", comment.login()),
                 path: root.join(&path),
                 location: format!(
-                    "{}:{} ({})",
+                    "{}:{}{} ({})",
                     path,
+                    start.map(|start| format!("{start}-")).unwrap_or_default(),
                     line,
                     match side {
                         Side::Right => "new",
@@ -167,8 +169,12 @@ pub(crate) fn pr_comments(
                 author: "you (pending)".into(),
                 path: root.join(&anchor.path),
                 location: format!(
-                    "{}:{} ({})",
+                    "{}:{}{} ({})",
                     anchor.path,
+                    anchor
+                        .start_line
+                        .map(|start| format!("{start}-"))
+                        .unwrap_or_default(),
                     anchor.line,
                     match side {
                         Side::Right => "new",
@@ -434,40 +440,59 @@ fn comment_target(cx: &compositor::Context) -> Result<CommentTarget, String> {
 
     let (view, doc) = current_ref!(cx.editor);
 
-    // Inside the `:pr-diff` buffer the anchor comes from the rendered lines.
-    if Some(view.doc) == diff_doc {
-        let line = doc
-            .selection(view.id)
-            .primary()
-            .cursor_line(doc.text().slice(..));
-        let Some(Some(anchor)) = line_anchors.get(line) else {
-            return Err("The cursor is not on a diff line".into());
-        };
-        return Ok(CommentTarget {
-            anchor: anchor.clone(),
-        });
-    }
-
-    // Inside a real file: the anchor is the cursor line, but only lines that
-    // are part of the diff can be commented on.
+    // Inside a real file: the anchor is the selection's line span, but only
+    // lines that are part of the diff can be commented on.
     let path = doc
         .path()
         .and_then(|path| path.strip_prefix(&root).ok().map(Path::to_string_lossy))
         .ok_or_else(|| "Move the cursor into the PR diff buffer (:pr-diff) first".to_string())?;
-    let line = doc
+
+    // Inside the `:pr-diff` buffer the anchor comes from the rendered lines;
+    // a multi-line selection spans the first to the last anchored line.
+    if Some(view.doc) == diff_doc {
+        let (first_row, last_row) = doc
+            .selection(view.id)
+            .primary()
+            .line_range(doc.text().slice(..));
+        let first = line_anchors.get(first_row).cloned().flatten();
+        let last = line_anchors.get(last_row).cloned().flatten();
+        let anchor = match (first, last) {
+            (Some(first), Some(last)) if first.path == last.path && first.side == last.side => {
+                Some(review::Anchor {
+                    start_line: (first.line != last.line).then_some(first.line),
+                    ..last
+                })
+            }
+            (Some(anchor), None) | (None, Some(anchor)) => Some(anchor),
+            _ => None,
+        };
+        return anchor
+            .map(|anchor| CommentTarget { anchor })
+            .ok_or_else(|| {
+                "The selection spans files or unanchored lines; anchor a comment to one diff line"
+                    .to_string()
+            });
+    }
+
+    let (first_line, last_line) = doc
         .selection(view.id)
         .primary()
-        .cursor_line(doc.text().slice(..));
+        .line_range(doc.text().slice(..));
+    let (start_line, end_line) = (first_line as u32 + 1, last_line as u32 + 1);
+
     let Some(anchor) = review::with_review_state(|state| {
-        state
-            .commentable
-            .get(path.as_ref())
-            .is_some_and(|lines| lines.contains(&((line + 1) as u32)))
-            .then(|| review::Anchor {
-                path: path.into_owned(),
-                side: Side::Right,
-                line: (line + 1) as u32,
-            })
+        // Every line of a multi-line comment must be part of the diff on the
+        // same (new) side, mirroring GitHub's range rules.
+        let lines = state.commentable.get(path.as_ref())?;
+        if lines.range(start_line..=end_line).count() != (end_line - start_line + 1) as usize {
+            return None;
+        }
+        Some(review::Anchor {
+            path: path.into_owned(),
+            side: Side::Right,
+            line: end_line,
+            start_line: (start_line != end_line).then_some(start_line),
+        })
     })
     .flatten() else {
         return Err(

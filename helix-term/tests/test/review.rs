@@ -222,48 +222,40 @@ async fn pending_comment_and_review_submission() -> anyhow::Result<()> {
         app.editor.new_file(helix_view::editor::Action::Replace);
     }
 
-    let anchor_line = helix_term::review::with_review_state(|state| {
-        state
-            .commentable
-            .get("main.rs")
-            .and_then(|lines| lines.iter().next().copied())
-    })
-    .flatten()
-    .expect("the PR should have commentable lines in main.rs");
+    let commentable =
+        helix_term::review::with_review_state(|state| state.commentable.get("main.rs").cloned())
+            .flatten()
+            .expect("the PR should have commentable lines in main.rs");
+    let first_line = *commentable.iter().next().unwrap(); // 1-based
+    let last_line = *commentable.iter().next_back().unwrap(); // 1-based
 
-    // `test_key_sequence` returns `Err` when the editor does not go idle
-    // within its window; the review jobs can exceed that, so the state is
-    // asserted separately below.
+    // Select from the first to the last diff line of the file with a
+    // linewise selection (`gg` then `V` + `j` per line) and comment on the
+    // whole range.
+    // `x` extends the selection one line below; from the top of the file it
+    // selects lines 1..=last_line.
+    let select_keys = format!("gg{}", "x".repeat(last_line as usize));
+    // Make sure a view exists and the reviewed file is focused, then select
+    // from the first to the last diff line with a linewise selection (`gg`,
+    // `V`, extend with `j`) and comment on the whole range.
+    if app.editor.tree.views().next().is_none() {
+        app.editor.new_file(helix_view::editor::Action::Replace);
+    }
+    app.editor.open(
+        &stub.repo.join("main.rs"),
+        helix_view::editor::Action::Replace,
+    )?;
+
+    // `x` extends the selection one line below; from the top of the file it
+    // selects lines 1..=last_line.
+    let select_keys = format!("gg{}", "x".repeat(last_line as usize));
     let _ = test_key_sequence(
         &mut app,
-        Some(&format!(
-            ":open {}<ret>:pr-comment looks good<ret>",
-            stub.repo.join("main.rs").display()
-        )),
+        Some(&format!("{select_keys}:pr-comment looks good<ret>")),
         None,
         false,
     )
     .await;
-    let mut pending: Option<Vec<String>> = None;
-    for _ in 0..50 {
-        pending = helix_term::review::with_review_state(|state| {
-            state
-                .pending
-                .iter()
-                .map(|comment| comment.body.clone())
-                .collect::<Vec<_>>()
-        });
-        if pending.as_ref().is_some_and(|pending| !pending.is_empty()) {
-            break;
-        }
-        pump(&mut app).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert_eq!(
-        pending.as_deref(),
-        Some(&["looks good".to_string()][..]),
-        "pending comment was not recorded: {pending:?}"
-    );
 
     // Publish the review; the job may outlive the harness idle window, so
     // assert on the request that `gh` received rather than on the job result.
@@ -294,8 +286,12 @@ async fn pending_comment_and_review_submission() -> anyhow::Result<()> {
         "pending comment body missing from payload: {payload}"
     );
     assert!(
-        published.contains(&format!("\"line\":{anchor_line}")),
-        "comment anchor line {anchor_line} missing from payload: {payload}"
+        published.contains(&format!("\"line\":{last_line}")),
+        "comment end line {last_line} missing from payload: {payload}"
+    );
+    assert!(
+        published.contains(&format!("\"start_line\":{first_line}")),
+        "comment start line {first_line} missing from payload: {payload}"
     );
     assert!(
         published.contains("\"path\":\"main.rs\"") && published.contains("\"side\":\"RIGHT\""),

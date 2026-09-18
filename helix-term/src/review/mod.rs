@@ -69,8 +69,11 @@ pub struct Anchor {
     /// comments API.
     pub path: String,
     pub side: Side,
-    /// 1-based line number on the given side.
+    /// 1-based line number on the given side. For a multi-line comment this
+    /// is the last line of the range.
     pub line: u32,
+    /// The first line of a multi-line comment, if it spans a range.
+    pub start_line: Option<u32>,
 }
 
 /// The review buffer contents together with per-line metadata. The line

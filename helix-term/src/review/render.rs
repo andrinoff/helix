@@ -127,6 +127,10 @@ pub fn render_review(
                             push_comment_block(
                                 &mut push,
                                 &author_prefix(&comments[index]),
+                                comment_span(
+                                    comment_range(&comments[index]),
+                                    comments[index].line.or(comments[index].original_line),
+                                ),
                                 &comments[index].body,
                             );
                         }
@@ -134,7 +138,15 @@ pub fn render_review(
                     if let Some(indices) = pending_map.get(&key) {
                         for &index in indices {
                             pending_placed.insert(index);
-                            push_comment_block(&mut push, "you (pending):", &pending[index].body);
+                            push_comment_block(
+                                &mut push,
+                                "you (pending):",
+                                comment_span(
+                                    pending[index].anchor.start_line,
+                                    Some(pending[index].anchor.line),
+                                ),
+                                &pending[index].body,
+                            );
                         }
                     }
                 }
@@ -158,7 +170,15 @@ pub fn render_review(
             None,
         );
         for comment in outdated {
-            push_comment_block(&mut push, &author_prefix(comment), &comment.body);
+            push_comment_block(
+                &mut push,
+                &author_prefix(comment),
+                comment_span(
+                    comment_range(comment),
+                    comment.line.or(comment.original_line),
+                ),
+                &comment.body,
+            );
         }
     }
 
@@ -178,7 +198,12 @@ pub fn render_review(
             None,
         );
         for comment in unplaced {
-            push_comment_block(&mut push, "you (pending):", &comment.body);
+            push_comment_block(
+                &mut push,
+                "you (pending):",
+                comment_span(comment.anchor.start_line, Some(comment.anchor.line)),
+                &comment.body,
+            );
         }
     }
 
@@ -232,6 +257,7 @@ fn render_diff_line(file: &PrFileDiff, line: &PrDiffLine) -> (String, Option<Anc
                 path: file.new_path.clone(),
                 side: Side::Right,
                 line,
+                start_line: None,
             }),
         DiffLineKind::Del => line
             .old_line
@@ -240,6 +266,7 @@ fn render_diff_line(file: &PrFileDiff, line: &PrDiffLine) -> (String, Option<Anc
                 path: file.old_path.clone(),
                 side: Side::Left,
                 line,
+                start_line: None,
             }),
         DiffLineKind::Context => {
             if file.new_path != "/dev/null" {
@@ -247,12 +274,14 @@ fn render_diff_line(file: &PrFileDiff, line: &PrDiffLine) -> (String, Option<Anc
                     path: file.new_path.clone(),
                     side: Side::Right,
                     line,
+                    start_line: None,
                 })
             } else {
                 line.old_line.map(|line| Anchor {
                     path: file.old_path.clone(),
                     side: Side::Left,
                     line,
+                    start_line: None,
                 })
             }
         }
@@ -373,7 +402,10 @@ pub fn file_virtual_blocks(
             &mut comment_blocks,
             line,
             &comment.body,
-            &author_prefix(comment),
+            &format_author(
+                &author_prefix(comment),
+                comment_span(comment_range(comment), Some(line)),
+            ),
             VirtualRowKind::Comment,
             width,
         );
@@ -386,7 +418,10 @@ pub fn file_virtual_blocks(
             &mut comment_blocks,
             comment.anchor.line,
             &comment.body,
-            "you (pending):",
+            &format_author(
+                "you (pending):",
+                comment_span(comment.anchor.start_line, Some(comment.anchor.line)),
+            ),
             VirtualRowKind::Pending,
             width,
         );
@@ -462,10 +497,12 @@ fn push_block(blocks: &mut Vec<VirtualBlock>, line: usize, rows: &[VirtualRow]) 
 fn push_comment_block(
     push: &mut impl FnMut(String, LineKind, Option<Anchor>),
     author: &str,
+    span: Option<(u32, u32)>,
     body: &str,
 ) {
     // "    ┌ " consumes 7 columns.
     const WRAP_WIDTH: usize = 70;
+    let author = format_author(author, span);
     let mut first = true;
     for line in wrap_text(body, WRAP_WIDTH) {
         let line = if first {
@@ -477,6 +514,25 @@ fn push_comment_block(
         push(line, LineKind::Comment, None);
     }
     push("    └".into(), LineKind::Comment, None);
+}
+
+/// The first line of a multi-line comment, if it spans a range.
+fn comment_range(comment: &ReviewComment) -> Option<u32> {
+    comment.start_line.or(comment.original_start_line)
+}
+
+/// The (start, end) span of a multi-line comment, or `None` for single-line
+/// comments.
+fn comment_span(start_line: Option<u32>, end_line: Option<u32>) -> Option<(u32, u32)> {
+    Some((start_line?, end_line?))
+}
+
+/// `@alice (lines 12-15):` when the comment spans several lines.
+fn format_author(author: &str, span: Option<(u32, u32)>) -> String {
+    match span {
+        Some((start, end)) => format!("{} (lines {start}-{end}):", author.trim_end_matches(':')),
+        None => author.to_string(),
+    }
 }
 
 /// `@login:` or `↳ @login:` for replies.
@@ -821,7 +877,9 @@ mod tests {
             body: body.into(),
             path: Some(path.into()),
             line: Some(line),
+            start_line: None,
             original_line: Some(line),
+            original_start_line: None,
             side: Some(side.as_str().into()),
             in_reply_to_id: None,
             user: Some(GhUser {
@@ -933,6 +991,29 @@ diff --git a/src/lib.rs b/src/lib.rs
     }
 
     #[test]
+    fn renders_multi_line_pending_blocks() {
+        let diff = parse_unified_diff(SIMPLE_DIFF);
+        let pending = vec![PendingComment {
+            anchor: Anchor {
+                path: "src/lib.rs".into(),
+                side: Side::Right,
+                line: 12,
+                start_line: Some(10),
+            },
+            body: "this block".into(),
+        }];
+        let rendered = render_review(&detail(), &diff, &[], &pending);
+        assert!(
+            rendered
+                .text
+                .contains("┌ you (pending) (lines 10-12): this block"),
+            "multi-line pending comment should announce its range: {}\n{}",
+            rendered.text,
+            rendered.text
+        );
+    }
+
+    #[test]
     fn renders_pending_comment_blocks() {
         let diff = parse_unified_diff(SIMPLE_DIFF);
         let pending = vec![PendingComment {
@@ -940,6 +1021,7 @@ diff --git a/src/lib.rs b/src/lib.rs
                 path: "src/lib.rs".into(),
                 side: Side::Right,
                 line: 10,
+                start_line: None,
             },
             body: "please rename".into(),
         }];
@@ -1038,6 +1120,7 @@ Binary files a/img.png and b/img.png differ
                 path: "src/lib.rs".into(),
                 side: Side::Right,
                 line: 10,
+                start_line: None,
             },
             body: "rename".into(),
         }];

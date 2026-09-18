@@ -147,11 +147,18 @@ pub struct ReviewComment {
     #[serde(default)]
     pub path: Option<String>,
     /// Line in the current diff side, if the comment is still anchored.
+    /// For a multi-line comment this is the last line of the range.
     #[serde(default)]
     pub line: Option<u32>,
+    /// First line of a multi-line comment, if it spans a range.
+    #[serde(default)]
+    pub start_line: Option<u32>,
     /// Line in the diff as it was when the comment was written.
     #[serde(default)]
     pub original_line: Option<u32>,
+    /// First line of the range as it was when the comment was written.
+    #[serde(default)]
+    pub original_start_line: Option<u32>,
     /// `RIGHT` (new file) or `LEFT` (old file).
     #[serde(default)]
     pub side: Option<String>,
@@ -250,12 +257,19 @@ pub async fn submit_review(
         "comments": comments
             .iter()
             .map(|comment| {
-                serde_json::json!({
+                let mut payload = serde_json::json!({
                     "path": comment.anchor.path,
                     "side": comment.anchor.side.as_str(),
                     "line": comment.anchor.line,
                     "body": comment.body,
-                })
+                });
+                if let Some(start_line) = comment.anchor.start_line {
+                    payload["start_line"] = serde_json::json!(start_line);
+                    if comment.anchor.side == Side::Left {
+                        payload["start_side"] = serde_json::json!("LEFT");
+                    }
+                }
+                payload
             })
             .collect::<Vec<_>>(),
     });
@@ -369,7 +383,9 @@ mod tests {
             body: "hi".into(),
             path: Some("src/lib.rs".into()),
             line: Some(42),
+            start_line: None,
             original_line: Some(40),
+            original_start_line: None,
             side: Some("RIGHT".into()),
             in_reply_to_id: None,
             user: None,
